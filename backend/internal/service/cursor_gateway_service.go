@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
@@ -20,22 +19,11 @@ import (
 // Cursor's Connect-RPC protobuf format, streams the response, and converts
 // it back into OpenAI SSE format.
 type CursorGatewayService struct {
-	accountRepo     AccountRepository
-	refreshAPI      *OAuthRefreshAPI
-	refresher       *CursorTokenRefresher
-	streamChat      func(ctx context.Context, creds cursor.Credentials, req cursor.AgentRunRequest) (*http.Response, error)
-	availableModels func(ctx context.Context, creds cursor.Credentials) ([]cursor.AvailableModel, error)
-
-	catalogMu        sync.Mutex
-	catalogByAccount map[int64]cursorCatalogEntry
+	accountRepo AccountRepository
+	refreshAPI  *OAuthRefreshAPI
+	refresher   *CursorTokenRefresher
+	streamChat  func(ctx context.Context, creds cursor.Credentials, req cursor.AgentRunRequest) (*http.Response, error)
 }
-
-type cursorCatalogEntry struct {
-	models []cursor.AvailableModel
-	expiry time.Time
-}
-
-const cursorCatalogTTL = 5 * time.Minute
 
 // NewCursorGatewayService creates a new CursorGatewayService.
 func NewCursorGatewayService(accountRepo AccountRepository, refreshAPI *OAuthRefreshAPI) *CursorGatewayService {
@@ -88,10 +76,8 @@ func (s *CursorGatewayService) ForwardAsChatCompletions(
 		return nil, s.writeChatCompletionsError(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse messages")
 	}
 
-	mappedModel := account.GetMappedModel(ccReq.Model)
-	opts := cursorRunOpts(ccReq.ReasoningEffort, ccReq.Reasoning, ccReq.Fast, ccReq.Thinking)
-	req := buildCursorAgentRunRequest(mappedModel, openAIMessages, ccReq.Tools, cursorToolChoiceString(ccReq.ToolChoice))
-	resp, _, warnings, err := s.startCursorChat(ctx, c, account, req, opts)
+	req := buildCursorAgentRunRequest(ccReq.Model, openAIMessages, ccReq.Tools, cursorToolChoiceString(ccReq.ToolChoice))
+	resp, _, warnings, err := s.startCursorChat(ctx, c, account, req)
 	if err != nil {
 		return nil, err
 	}
@@ -104,50 +90,20 @@ func (s *CursorGatewayService) ForwardAsChatCompletions(
 	return s.nonStreamResponse(c, resp.Body, ccReq.Model, warnings, startTime)
 }
 
-func resolveCursorChatModel(requested string, opts cursor.RunOpts) (upstream string, warnings []map[string]string) {
-	return resolveCursorRunModel(requested, opts, nil)
-}
-
-func resolveCursorRunModel(requested string, opts cursor.RunOpts, catalog []cursor.AvailableModel) (upstream string, warnings []map[string]string) {
-	resolved := cursor.ResolveRunModel(requested, opts, catalog)
-	if resolved.RunSlug == "" {
-		return requested, nil
-	}
-	if resolved.AliasFallback {
-		warnings = append(warnings, map[string]string{
-			"code":    "model_fallback",
-			"message": fmt.Sprintf("Requested model %q is not a Cursor picker slug; using fallback %q", requested, resolved.PickerID),
-		})
-	}
-	if resolved.VariantApplied {
-		warnings = append(warnings, map[string]string{
-			"code":    "model_variant",
-			"message": fmt.Sprintf("Requested model %q is a Cursor picker family; using AgentService slug %q", requested, resolved.RunSlug),
-		})
-	}
-	return resolved.RunSlug, warnings
-}
-
+// startCursorChat forwards req.Model unchanged. A name such as
+// grok-4.7-high-fast is the client's run slug, not a gateway alias.
 func (s *CursorGatewayService) startCursorChat(
 	ctx context.Context,
 	c *gin.Context,
 	account *Account,
 	req cursor.AgentRunRequest,
-	opts cursor.RunOpts,
 ) (*http.Response, string, []map[string]string, error) {
 	if err := s.ensureCursorAccessToken(ctx, account); err != nil {
 		logger.LegacyPrintf("service.cursor", "[Cursor] token refresh account=%d: %v", accountID(account), err)
 	}
 
-	requestedModel := req.Model
-	upstreamModel, warnings := resolveCursorRunModel(requestedModel, opts, s.liveRunCatalog(ctx, account))
-	if requestedModel != "" && !strings.EqualFold(requestedModel, upstreamModel) {
-		c.Header("X-Sub2API-Model-Variant", requestedModel+" -> "+upstreamModel)
-	}
-	if len(warnings) > 0 {
-		c.Header("X-Sub2API-Model-Fallback", requestedModel+" -> "+upstreamModel)
-		logger.LegacyPrintf("service.cursor", "[Cursor] model resolve requested=%s upstream=%s", requestedModel, upstreamModel)
-	}
+	upstreamModel := req.Model
+	var warnings []map[string]string
 
 	resp, err := s.doStreamChat(ctx, account, req, upstreamModel)
 	if err != nil && isCursorAuthError(err) {
@@ -172,48 +128,6 @@ func (s *CursorGatewayService) startCursorChat(
 		}
 	}
 	return resp, upstreamModel, warnings, nil
-}
-
-func cursorRunOptsFromAnthropic(req *apicompat.AnthropicRequest) cursor.RunOpts {
-	var opts cursor.RunOpts
-	if req == nil {
-		return opts
-	}
-	if req.OutputConfig != nil {
-		opts.Effort = cursor.NormalizeEffort(req.OutputConfig.Effort)
-	}
-	if req.Thinking != nil {
-		enabled := strings.EqualFold(req.Thinking.Type, "enabled") || strings.EqualFold(req.Thinking.Type, "adaptive")
-		opts.Thinking = &enabled
-	}
-	return opts
-}
-
-func cursorRunOptsFromResponses(req *apicompat.ResponsesRequest) cursor.RunOpts {
-	var opts cursor.RunOpts
-	if req == nil || req.Reasoning == nil {
-		return opts
-	}
-	opts.Effort = cursor.NormalizeEffort(req.Reasoning.Effort)
-	return opts
-}
-
-func cursorRunOpts(flatEffort *string, reasoning *struct {
-	Effort *string `json:"effort"`
-}, fast, thinking *bool) cursor.RunOpts {
-	opts := cursor.RunOpts{Thinking: thinking}
-	if fast != nil {
-		opts.Fast = *fast
-	}
-	effort := ""
-	if reasoning != nil && reasoning.Effort != nil {
-		effort = *reasoning.Effort
-	}
-	if flatEffort != nil && strings.TrimSpace(*flatEffort) != "" {
-		effort = *flatEffort
-	}
-	opts.Effort = cursor.NormalizeEffort(effort)
-	return opts
 }
 
 func (s *CursorGatewayService) buildCredentials(account *Account) cursor.Credentials {
@@ -271,70 +185,6 @@ func normalizeCursorAccessToken(token string) string {
 		token = strings.TrimSpace(token[i+2:])
 	}
 	return token
-}
-
-func (s *CursorGatewayService) liveRunCatalog(ctx context.Context, account *Account) []cursor.AvailableModel {
-	if s == nil || account == nil {
-		return nil
-	}
-	if models := s.cachedCatalog(account.ID); models != nil {
-		return models
-	}
-	models, err := s.fetchRunCatalog(ctx, account)
-	if err != nil && isCursorAuthError(err) {
-		if refreshErr := s.refreshCursorAccount(ctx, account, true); refreshErr == nil {
-			models, err = s.fetchRunCatalog(ctx, account)
-		}
-	}
-	if err != nil {
-		logger.LegacyPrintf("service.cursor", "[Cursor] AvailableModels account=%d: %v", account.ID, err)
-		return nil
-	}
-	s.storeCatalog(account.ID, models)
-	return models
-}
-
-// cursorLiveCatalogFetchTimeout caps the synchronous AvailableModels lookup on
-// the request hot path; on timeout the request falls back to the static
-// snapshot instead of stalling the client.
-const cursorLiveCatalogFetchTimeout = 5 * time.Second
-
-func (s *CursorGatewayService) fetchRunCatalog(ctx context.Context, account *Account) ([]cursor.AvailableModel, error) {
-	creds := cursorCredentialsFromAccount(account)
-	fetchCtx, cancel := context.WithTimeout(ctx, cursorLiveCatalogFetchTimeout)
-	defer cancel()
-	proxyURL := cursorAccountProxyURL(account)
-	if s.availableModels != nil {
-		return s.availableModels(fetchCtx, creds)
-	}
-	if strings.TrimSpace(creds.AccessToken) == "" {
-		return nil, fmt.Errorf("cursor: missing access_token")
-	}
-	client := cursor.NewClient(creds)
-	client.ProxyURL = proxyURL
-	return client.AvailableModels(fetchCtx)
-}
-
-func (s *CursorGatewayService) cachedCatalog(accountID int64) []cursor.AvailableModel {
-	s.catalogMu.Lock()
-	defer s.catalogMu.Unlock()
-	entry, ok := s.catalogByAccount[accountID]
-	if !ok || time.Now().After(entry.expiry) {
-		return nil
-	}
-	return entry.models
-}
-
-func (s *CursorGatewayService) storeCatalog(accountID int64, models []cursor.AvailableModel) {
-	s.catalogMu.Lock()
-	defer s.catalogMu.Unlock()
-	if s.catalogByAccount == nil {
-		s.catalogByAccount = make(map[int64]cursorCatalogEntry)
-	}
-	s.catalogByAccount[accountID] = cursorCatalogEntry{
-		models: models,
-		expiry: time.Now().Add(cursorCatalogTTL),
-	}
 }
 
 // FetchCursorPickerModels loads the live Cursor picker catalog for an account.

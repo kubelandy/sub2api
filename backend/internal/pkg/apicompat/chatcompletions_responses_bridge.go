@@ -609,6 +609,19 @@ func buildChatMessagesFromItems(messages []ChatMessage, rawItems []json.RawMessa
 			pendingReasoning = ""
 			lastTurnReasoning = ""
 			continue
+		case "compaction", "compaction_summary":
+			// Codex replaces earlier history with this item after remote
+			// compaction. Chat upstreams cannot read the item, so the handoff
+			// text has to become a message or the next turn loses the thread.
+			text := compactionHandoffText(item)
+			if text == "" {
+				continue
+			}
+			content, _ := json.Marshal("The conversation was compacted. Continue from this handoff summary:\n" + text)
+			messages = append(messages, ChatMessage{Role: "user", Content: content})
+			pendingReasoning = ""
+			lastTurnReasoning = ""
+			continue
 		}
 
 		// Only genuine message items become chat messages. Codex emits other
@@ -651,6 +664,41 @@ func buildChatMessagesFromItems(messages []ChatMessage, rawItems []json.RawMessa
 	}
 
 	return messages, mediaByCallID, nil
+}
+
+// compactionHandoffText returns the prose a later model should resume from.
+// Official encrypted_content is an opaque single-line blob and is not useful
+// as a prompt; a summary, or prose stored in encrypted_content, is.
+func compactionHandoffText(item map[string]json.RawMessage) string {
+	if text := strings.TrimSpace(responsesSummaryText(item["summary"])); text != "" {
+		return text
+	}
+	enc := strings.TrimSpace(rawString(item["encrypted_content"]))
+	if enc == "" || !strings.ContainsAny(enc, " \n\t") {
+		return ""
+	}
+	return enc
+}
+
+func responsesSummaryText(raw json.RawMessage) string {
+	raw = bytesTrimSpace(raw)
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, part := range parts {
+		if part.Type == "" || part.Type == "summary_text" {
+			b.WriteString(part.Text)
+		}
+	}
+	return b.String()
 }
 
 // agentMessageText 按原顺序拼接 agent_message 里 input_text 与 encrypted_content 片段的文本。

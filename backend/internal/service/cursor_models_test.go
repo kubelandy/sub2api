@@ -79,39 +79,17 @@ func TestNormalizeCursorAccessToken(t *testing.T) {
 	require.Equal(t, "plain", normalizeCursorAccessToken("  plain  "))
 }
 
-func TestResolveCursorChatModelWarnsOnAliasFallback(t *testing.T) {
-	upstream, warnings := resolveCursorChatModel("opus", cursor.RunOpts{})
-	require.Equal(t, "claude-opus-5-medium", upstream)
-	require.Equal(t, "model_fallback", warnings[0]["code"])
-	require.Equal(t, "model_variant", warnings[1]["code"])
-	require.Contains(t, warnings[0]["message"], "claude-opus-5")
-
-	upstream, warnings = resolveCursorChatModel("claude-opus-5", cursor.RunOpts{})
-	require.Equal(t, "claude-opus-5-medium", upstream)
-	require.Len(t, warnings, 1)
-	require.Equal(t, "model_variant", warnings[0]["code"])
-
-	upstream, warnings = resolveCursorChatModel("grok-4.6", cursor.RunOpts{})
-	require.Equal(t, "cursor-grok-4.6-medium", upstream)
-	require.Equal(t, "model_variant", warnings[0]["code"])
-
-	upstream, warnings = resolveCursorChatModel("composer-2.5", cursor.RunOpts{})
-	require.Equal(t, "composer-2.5", upstream)
-	require.Empty(t, warnings)
-
-	upstream, warnings = resolveCursorChatModel("cursor-grok-4.6-medium", cursor.RunOpts{})
-	require.Equal(t, "cursor-grok-4.6-medium", upstream)
-	require.Empty(t, warnings)
-}
-
-func TestResolveCursorRunModelUsesLiveCatalogSlugs(t *testing.T) {
-	catalog := []cursor.AvailableModel{{
-		Name:        "grok-4.6",
-		LegacySlugs: []string{"cursor-grok-4.6-xhigh"},
-	}}
-	upstream, warnings := resolveCursorRunModel("grok-4.6", cursor.RunOpts{}, catalog)
-	require.Equal(t, "cursor-grok-4.6-xhigh", upstream)
-	require.Equal(t, "model_variant", warnings[0]["code"])
+func TestCursorRunSlugAllowedWhenPickerIsMapped(t *testing.T) {
+	account := &Account{
+		Platform: PlatformCursor,
+		Credentials: map[string]any{
+			"model_mapping": map[string]any{"grok-4.7": "grok-4.7"},
+		},
+	}
+	require.True(t, account.IsModelSupported("grok-4.7-high-fast"))
+	require.True(t, account.IsModelSupported("grok-4.7"))
+	require.False(t, account.IsModelSupported("grok-4.6-high"))
+	require.Equal(t, "grok-4.7-high-fast", account.GetMappedModel("grok-4.7-high-fast"))
 }
 
 type gatewayModelsRepo struct {

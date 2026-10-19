@@ -285,7 +285,7 @@ func (h *GatewayHandler) ChatCompletions(c *gin.Context) {
 		// 5. Forward request
 		writerSizeBeforeForward := c.Writer.Size()
 		forwardBody := body
-		if channelMapping.Mapped {
+		if channelMapping.Mapped && account.Platform != service.PlatformCursor {
 			forwardBody = h.gatewayService.ReplaceModelInBody(body, channelMapping.MappedModel)
 		}
 		var result *service.ForwardResult

@@ -111,9 +111,6 @@ func TestCursorGatewayRefreshesExpiredTokenBeforeUpstream(t *testing.T) {
 	}
 	repo := &cursorCredRepo{account: account}
 	svc := NewCursorGatewayService(repo, nil)
-	svc.availableModels = func(context.Context, cursor.Credentials) ([]cursor.AvailableModel, error) {
-		return nil, fmt.Errorf("catalog unused")
-	}
 	svc.refresher.refresh = func(context.Context, string) (*cursor.TokenRefreshResult, error) {
 		return &cursor.TokenRefreshResult{AccessToken: "rotated", ExpiresIn: 3600}, nil
 	}
@@ -124,7 +121,7 @@ func TestCursorGatewayRefreshesExpiredTokenBeforeUpstream(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(nil))}, nil
 	}
 
-	resp, _, _, err := svc.startCursorChat(context.Background(), newCursorGinContext(), account, cursor.AgentRunRequest{Model: "grok-4.6"}, cursor.RunOpts{})
+	resp, _, _, err := svc.startCursorChat(context.Background(), newCursorGinContext(), account, cursor.AgentRunRequest{Model: "grok-4.6"})
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	resp.Body.Close()
@@ -147,9 +144,6 @@ func TestCursorGatewayRetriesAfterUnauthorized(t *testing.T) {
 	}
 	repo := &cursorCredRepo{account: account}
 	svc := NewCursorGatewayService(repo, nil)
-	svc.availableModels = func(context.Context, cursor.Credentials) ([]cursor.AvailableModel, error) {
-		return nil, fmt.Errorf("catalog unused")
-	}
 	svc.refresher.refresh = func(context.Context, string) (*cursor.TokenRefreshResult, error) {
 		return &cursor.TokenRefreshResult{AccessToken: "after-401", ExpiresIn: 3600}, nil
 	}
@@ -163,7 +157,7 @@ func TestCursorGatewayRetriesAfterUnauthorized(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(nil))}, nil
 	}
 
-	resp, _, _, err := svc.startCursorChat(context.Background(), newCursorGinContext(), account, cursor.AgentRunRequest{Model: "grok-4.6"}, cursor.RunOpts{})
+	resp, _, _, err := svc.startCursorChat(context.Background(), newCursorGinContext(), account, cursor.AgentRunRequest{Model: "grok-4.6"})
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, []string{fresh, "after-401"}, seen)
@@ -178,52 +172,20 @@ func TestIsCursorAuthError(t *testing.T) {
 	require.False(t, isCursorAuthError(nil))
 }
 
-func TestCursorGatewayResolvesRunSlugFromLiveCatalog(t *testing.T) {
+func TestCursorGatewayForwardsRequestedModel(t *testing.T) {
 	account := cursorAccountWithFreshToken(13)
 	svc := NewCursorGatewayService(nil, nil)
-	var fetches int
-	svc.availableModels = func(context.Context, cursor.Credentials) ([]cursor.AvailableModel, error) {
-		fetches++
-		return []cursor.AvailableModel{{
-			Name:        "grok-4.6",
-			LegacySlugs: []string{"cursor-grok-4.6-xhigh"},
-		}}, nil
-	}
 	var seen []string
 	svc.streamChat = func(_ context.Context, _ cursor.Credentials, req cursor.AgentRunRequest) (*http.Response, error) {
 		seen = append(seen, req.Model)
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(nil))}, nil
 	}
 
-	resp, upstream, _, err := svc.startCursorChat(context.Background(), newCursorGinContext(), account, cursor.AgentRunRequest{Model: "grok-4.6"}, cursor.RunOpts{})
+	resp, upstream, _, err := svc.startCursorChat(context.Background(), newCursorGinContext(), account, cursor.AgentRunRequest{Model: "grok-4.7-high-fast"})
 	require.NoError(t, err)
 	resp.Body.Close()
-	require.Equal(t, "cursor-grok-4.6-xhigh", upstream)
-	require.Equal(t, []string{"cursor-grok-4.6-xhigh"}, seen)
-
-	resp, _, _, err = svc.startCursorChat(context.Background(), newCursorGinContext(), account, cursor.AgentRunRequest{Model: "grok-4.6"}, cursor.RunOpts{})
-	require.NoError(t, err)
-	resp.Body.Close()
-	require.Equal(t, 1, fetches)
-}
-
-func TestCursorGatewayFallsBackToSnapshotWhenCatalogFails(t *testing.T) {
-	account := cursorAccountWithFreshToken(14)
-	svc := NewCursorGatewayService(nil, nil)
-	svc.availableModels = func(context.Context, cursor.Credentials) ([]cursor.AvailableModel, error) {
-		return nil, fmt.Errorf("catalog down")
-	}
-	var seen string
-	svc.streamChat = func(_ context.Context, _ cursor.Credentials, req cursor.AgentRunRequest) (*http.Response, error) {
-		seen = req.Model
-		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(nil))}, nil
-	}
-
-	resp, upstream, _, err := svc.startCursorChat(context.Background(), newCursorGinContext(), account, cursor.AgentRunRequest{Model: "grok-4.6"}, cursor.RunOpts{})
-	require.NoError(t, err)
-	resp.Body.Close()
-	require.Equal(t, "cursor-grok-4.6-medium", upstream)
-	require.Equal(t, "cursor-grok-4.6-medium", seen)
+	require.Equal(t, "grok-4.7-high-fast", upstream)
+	require.Equal(t, []string{"grok-4.7-high-fast"}, seen)
 }
 
 func cursorAccountWithFreshToken(id int64) *Account {
@@ -270,9 +232,6 @@ func TestCursorGatewayForceRefreshGoesThroughRefreshAPI(t *testing.T) {
 	}
 	repo := &cursorCredRepo{account: account}
 	svc := NewCursorGatewayService(repo, NewOAuthRefreshAPI(repo, nil))
-	svc.availableModels = func(context.Context, cursor.Credentials) ([]cursor.AvailableModel, error) {
-		return nil, fmt.Errorf("catalog unused")
-	}
 	svc.refresher.refresh = func(context.Context, string) (*cursor.TokenRefreshResult, error) {
 		return &cursor.TokenRefreshResult{AccessToken: "rotated-401", ExpiresIn: 3600}, nil
 	}
@@ -286,7 +245,7 @@ func TestCursorGatewayForceRefreshGoesThroughRefreshAPI(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(nil))}, nil
 	}
 
-	resp, _, _, err := svc.startCursorChat(context.Background(), newCursorGinContext(), account, cursor.AgentRunRequest{Model: "grok-4.6"}, cursor.RunOpts{})
+	resp, _, _, err := svc.startCursorChat(context.Background(), newCursorGinContext(), account, cursor.AgentRunRequest{Model: "grok-4.6"})
 	require.NoError(t, err)
 	resp.Body.Close()
 	require.Equal(t, []string{fresh, "rotated-401"}, seen)

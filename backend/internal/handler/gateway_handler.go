@@ -896,7 +896,7 @@ func (h *GatewayHandler) Messages(c *gin.Context) {
 			// ===== 用户消息串行队列 END =====
 
 			// 渠道模型映射只作用于本次账号尝试，避免 failover 后污染原始 ParsedRequest。
-			if channelMapping.Mapped {
+			if channelMapping.Mapped && account.Platform != service.PlatformCursor {
 				attemptParsedReq.Model = channelMapping.MappedModel
 				if err := attemptParsedReq.ReplaceBody(h.gatewayService.ReplaceModelInBody(attemptParsedReq.Body.Bytes(), channelMapping.MappedModel)); err != nil {
 					h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")

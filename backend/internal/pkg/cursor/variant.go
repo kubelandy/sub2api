@@ -148,6 +148,14 @@ func parseRunSlug(slug string) parsedRunSlug {
 	return out
 }
 
+// PickerFamily returns the catalog picker id implied by a run slug.
+// grok-4.7-high-fast is a variant of grok-4.7, not a separate picker model.
+// parameterized is false when the name has no effort, fast, or thinking suffix.
+func PickerFamily(slug string) (family string, parameterized bool) {
+	parsed := parseRunSlug(slug)
+	return parsed.FamilyHint, parsed.Parameterized
+}
+
 func newRunIndex() *runIndex {
 	return &runIndex{
 		slugsByPicker: make(map[string][]string),

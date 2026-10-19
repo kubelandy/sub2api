@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,40 +16,6 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 )
-
-func TestCursorRunOptsFromAnthropicMapsEffortAndThinking(t *testing.T) {
-	enabled := true
-	opts := cursorRunOptsFromAnthropic(&apicompat.AnthropicRequest{
-		OutputConfig: &apicompat.AnthropicOutputConfig{Effort: "max"},
-		Thinking:     &apicompat.AnthropicThinking{Type: "enabled"},
-	})
-	require.Equal(t, "max", opts.Effort)
-	require.NotNil(t, opts.Thinking)
-	require.Equal(t, enabled, *opts.Thinking)
-
-	upstream, warnings := resolveCursorChatModel("claude-opus-5", opts)
-	require.Equal(t, "claude-opus-5-thinking-max", upstream)
-	require.Equal(t, "model_variant", warnings[0]["code"])
-}
-
-func TestCursorRunOptsFromAnthropicDoesNotForceMedium(t *testing.T) {
-	opts := cursorRunOptsFromAnthropic(&apicompat.AnthropicRequest{})
-	require.Empty(t, opts.Effort)
-	require.Nil(t, opts.Thinking)
-
-	upstream, _ := resolveCursorChatModel("claude-opus-5", opts)
-	require.Equal(t, "claude-opus-5-medium", upstream)
-}
-
-func TestCursorRunOptsFromResponsesMapsEffort(t *testing.T) {
-	opts := cursorRunOptsFromResponses(&apicompat.ResponsesRequest{
-		Reasoning: &apicompat.ResponsesReasoning{Effort: "high"},
-	})
-	require.Equal(t, "high", opts.Effort)
-
-	upstream, _ := resolveCursorChatModel("grok-4.6", opts)
-	require.Equal(t, "cursor-grok-4.6-high", upstream)
-}
 
 func TestCursorMessagesFromChatFlattensTextParts(t *testing.T) {
 	parts, err := json.Marshal([]map[string]string{
@@ -170,9 +135,6 @@ func TestCursorForwardAsChatCompletionsAcceptsContentPartsArray(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	account := cursorAccountWithFreshToken(21)
 	svc := NewCursorGatewayService(nil, nil)
-	svc.availableModels = func(context.Context, cursor.Credentials) ([]cursor.AvailableModel, error) {
-		return nil, fmt.Errorf("catalog unused")
-	}
 	var contents []string
 	svc.streamChat = func(_ context.Context, _ cursor.Credentials, req cursor.AgentRunRequest) (*http.Response, error) {
 		for _, m := range req.Messages {
@@ -304,4 +266,111 @@ func encodeCursorThinkingAndTextFrames(t *testing.T, thinking, text string, inpu
 	endFrame, err := cursor.EncodeFrame(endServer.Result(), false)
 	require.NoError(t, err)
 	return append(out, endFrame...)
+}
+
+func TestForwardAsResponsesRemoteCompactionEmitsOneItem(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	account := cursorAccountWithFreshToken(44)
+	svc := NewCursorGatewayService(nil, nil)
+	svc.streamChat = func(context.Context, cursor.Credentials, cursor.AgentRunRequest) (*http.Response, error) {
+		t.Fatal("compaction must not call Cursor")
+		return nil, nil
+	}
+
+	body := []byte(`{
+		"model": "grok-4.7-high-fast",
+		"stream": true,
+		"tools": [{"type":"function","name":"shell","parameters":{"type":"object"}}],
+		"input": [
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"fix the login bug"}]},
+			{"type":"compaction_trigger"}
+		]
+	}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+
+	_, err := svc.ForwardAsResponses(context.Background(), c, account, body)
+	require.NoError(t, err)
+
+	var compactionItems, otherItems int
+	var completedOutput []map[string]any
+	sawCompleted := false
+	for _, block := range bytes.Split(bytes.TrimSpace(rec.Body.Bytes()), []byte("\n\n")) {
+		var event, data string
+		for _, line := range bytes.Split(block, []byte("\n")) {
+			switch {
+			case bytes.HasPrefix(line, []byte("event: ")):
+				event = string(bytes.TrimPrefix(line, []byte("event: ")))
+			case bytes.HasPrefix(line, []byte("data: ")):
+				data = string(bytes.TrimPrefix(line, []byte("data: ")))
+			}
+		}
+		var payload map[string]any
+		require.NoError(t, json.Unmarshal([]byte(data), &payload))
+		switch event {
+		case "response.output_item.done":
+			item, _ := payload["item"].(map[string]any)
+			if item["type"] == "compaction" {
+				compactionItems++
+				enc, _ := item["encrypted_content"].(string)
+				require.Contains(t, enc, "fix the login bug")
+				summary, _ := item["summary"].([]any)
+				require.Len(t, summary, 1)
+			} else {
+				otherItems++
+			}
+		case "response.completed":
+			sawCompleted = true
+			response, _ := payload["response"].(map[string]any)
+			rawOutput, _ := response["output"].([]any)
+			require.Len(t, rawOutput, 1)
+			for _, raw := range rawOutput {
+				item, _ := raw.(map[string]any)
+				completedOutput = append(completedOutput, item)
+			}
+		}
+	}
+	require.True(t, sawCompleted)
+	require.Equal(t, 1, compactionItems)
+	require.Zero(t, otherItems)
+	require.Equal(t, "compaction", completedOutput[0]["type"])
+	require.NotContains(t, rec.Body.String(), `"type":"message"`)
+	require.NotContains(t, rec.Body.String(), `"type":"reasoning"`)
+}
+
+func TestForwardAsResponsesCarriesCompactionHandoff(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	account := cursorAccountWithFreshToken(45)
+	svc := NewCursorGatewayService(nil, nil)
+	var captured cursor.AgentRunRequest
+	svc.streamChat = func(_ context.Context, _ cursor.Credentials, req cursor.AgentRunRequest) (*http.Response, error) {
+		captured = req
+		body := encodeCursorAssistantFrames(t, "continued", 3, 1)
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(body))}, nil
+	}
+
+	body := []byte(`{
+		"model": "grok-4.7-high-fast",
+		"stream": true,
+		"input": [
+			{"type":"compaction","encrypted_content":"opaqueblob","summary":[{"type":"summary_text","text":"login fix is half done"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+		]
+	}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+
+	_, err := svc.ForwardAsResponses(context.Background(), c, account, body)
+	require.NoError(t, err)
+
+	var upstream string
+	for _, message := range captured.Messages {
+		upstream += message.Content + "\n"
+	}
+	require.Contains(t, upstream, "login fix is half done")
+	require.Contains(t, upstream, "continue")
+	require.NotContains(t, upstream, "opaqueblob")
+	require.NotContains(t, upstream, "CONTEXT CHECKPOINT COMPACTION")
 }

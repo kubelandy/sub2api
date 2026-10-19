@@ -100,6 +100,17 @@ func TestResolveRunModelUsesLiveCatalogLegacySlugs(t *testing.T) {
 	}
 }
 
+func TestPickerFamily(t *testing.T) {
+	family, parameterized := PickerFamily("grok-4.7-high-fast")
+	if family != "grok-4.7" || !parameterized {
+		t.Fatalf("high-fast: %q %v", family, parameterized)
+	}
+	family, parameterized = PickerFamily("grok-4.7")
+	if family != "grok-4.7" || parameterized {
+		t.Fatalf("picker: %q %v", family, parameterized)
+	}
+}
+
 func TestNormalizeEffort(t *testing.T) {
 	tests := map[string]string{
 		"x-high":     "xhigh",

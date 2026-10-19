@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -60,9 +59,6 @@ func TestForwardAsChatCompletionsPassesImages(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	account := cursorAccountWithFreshToken(61)
 	svc := NewCursorGatewayService(nil, nil)
-	svc.availableModels = func(context.Context, cursor.Credentials) ([]cursor.AvailableModel, error) {
-		return nil, fmt.Errorf("catalog unused")
-	}
 	var captured cursor.AgentRunRequest
 	svc.streamChat = func(_ context.Context, _ cursor.Credentials, req cursor.AgentRunRequest) (*http.Response, error) {
 		captured = req

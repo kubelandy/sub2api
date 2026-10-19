@@ -16,6 +16,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/domain"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/cursor"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/geminicli"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai_compat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/typesafe"
@@ -937,6 +938,14 @@ func (a *Account) isModelMappingSupported(requestedModel string) bool {
 	}
 	if mappingSupportsRequestedModel(mapping, requestedModel) {
 		return true
+	}
+	// Cursor 的模型列表存的是选择器 id（grok-4.7）。客户端发来的
+	// grok-4.7-high-fast 是这个模型的运行档，不是另一条目录项。白名单认
+	// 选择器即可，转发仍用客户端原来的名字。
+	if a.Platform == PlatformCursor {
+		if family, parameterized := cursor.PickerFamily(requestedModel); parameterized && mappingSupportsRequestedModel(mapping, family) {
+			return true
+		}
 	}
 	normalized := normalizeRequestedModelForLookup(a.Platform, requestedModel)
 	return normalized != requestedModel && mappingSupportsRequestedModel(mapping, normalized)

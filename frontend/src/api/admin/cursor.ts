@@ -22,8 +22,8 @@ export interface CursorOAuthPollResult {
 }
 
 export async function startCursorOAuth(): Promise<CursorOAuthStartResponse> {
-  const res = await apiClient.post<{ data: CursorOAuthStartResponse }>('/admin/cursor/oauth/start')
-  return res.data.data
+  const { data } = await apiClient.post<CursorOAuthStartResponse>('/admin/cursor/oauth/start')
+  return data
 }
 
 export async function pollCursorOAuth(
@@ -31,10 +31,10 @@ export async function pollCursorOAuth(
   verifier: string,
   proxyId?: number | null
 ): Promise<CursorOAuthPollResult> {
-  const res = await apiClient.post<{ data: CursorOAuthPollResult }>('/admin/cursor/oauth/poll', {
+  const { data } = await apiClient.post<CursorOAuthPollResult>('/admin/cursor/oauth/poll', {
     uuid,
     verifier,
     proxy_id: proxyId ?? undefined
   })
-  return res.data.data
+  return data
 }

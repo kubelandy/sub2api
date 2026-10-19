@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -141,10 +140,6 @@ func TestForwardAsChatCompletionsToolRoundTrip(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	account := cursorAccountWithFreshToken(41)
 	svc := NewCursorGatewayService(nil, nil)
-	svc.availableModels = func(context.Context, cursor.Credentials) ([]cursor.AvailableModel, error) {
-		return nil, fmt.Errorf("catalog unused")
-	}
-
 	var captured cursor.AgentRunRequest
 	svc.streamChat = func(_ context.Context, _ cursor.Credentials, req cursor.AgentRunRequest) (*http.Response, error) {
 		captured = req
@@ -194,9 +189,6 @@ func TestForwardAsChatCompletionsToolRoundTripNonStream(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	account := cursorAccountWithFreshToken(42)
 	svc := NewCursorGatewayService(nil, nil)
-	svc.availableModels = func(context.Context, cursor.Credentials) ([]cursor.AvailableModel, error) {
-		return nil, fmt.Errorf("catalog unused")
-	}
 	svc.streamChat = func(_ context.Context, _ cursor.Credentials, _ cursor.AgentRunRequest) (*http.Response, error) {
 		body := encodeCursorToolCallBody(t, "call-78", "get_weather", `{"city":"Paris"}`)
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(body))}, nil
@@ -235,10 +227,6 @@ func TestForwardAsAnthropicToolRoundTrip(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	account := cursorAccountWithFreshToken(43)
 	svc := NewCursorGatewayService(nil, nil)
-	svc.availableModels = func(context.Context, cursor.Credentials) ([]cursor.AvailableModel, error) {
-		return nil, fmt.Errorf("catalog unused")
-	}
-
 	var captured cursor.AgentRunRequest
 	svc.streamChat = func(_ context.Context, _ cursor.Credentials, req cursor.AgentRunRequest) (*http.Response, error) {
 		captured = req
@@ -279,9 +267,6 @@ func TestForwardAsResponsesToolRoundTrip(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	account := cursorAccountWithFreshToken(44)
 	svc := NewCursorGatewayService(nil, nil)
-	svc.availableModels = func(context.Context, cursor.Credentials) ([]cursor.AvailableModel, error) {
-		return nil, fmt.Errorf("catalog unused")
-	}
 	svc.streamChat = func(_ context.Context, _ cursor.Credentials, req cursor.AgentRunRequest) (*http.Response, error) {
 		require.Len(t, req.Tools, 1)
 		body := encodeCursorToolCallBody(t, "fc_1", "get_weather", `{"city":"Paris"}`)

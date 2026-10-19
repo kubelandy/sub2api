@@ -582,10 +582,10 @@
             <p v-if="cursorAccessToken" class="text-xs text-emerald-600 dark:text-emerald-400" data-testid="cursor-oauth-done">
               {{ t('admin.accounts.cursor.oauthDone') }}
             </p>
-            <p v-if="cursorOAuthError" class="text-xs text-red-600 dark:text-red-400" data-testid="cursor-oauth-error">
-              {{ cursorOAuthError }}
-            </p>
           </template>
+          <p v-if="cursorOAuthError" class="text-xs text-red-600 dark:text-red-400" data-testid="cursor-oauth-error">
+            {{ cursorOAuthError }}
+          </p>
         </div>
 
         <p v-if="cursorAuthMethod === 'manual'" class="text-xs text-gray-500 dark:text-gray-400">{{ t('admin.accounts.cursor.hint') }}</p>
@@ -4728,7 +4728,12 @@ async function startCursorOAuthFlow() {
     stopCursorOAuthPolling()
     cursorOAuthTimer = setInterval(pollCursorOAuthOnce, 2000)
   } catch (e) {
-    cursorOAuthError.value = e instanceof Error ? e.message : String(e)
+    const message = e instanceof Error
+      ? e.message
+      : e && typeof e === 'object' && 'message' in e && typeof e.message === 'string'
+        ? e.message
+        : String(e)
+    cursorOAuthError.value = message || t('admin.accounts.cursor.oauthTimeout')
   } finally {
     cursorOAuthStarting.value = false
   }

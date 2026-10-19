@@ -41,9 +41,8 @@ func (s *CursorGatewayService) ForwardAsAnthropic(
 		return nil, fmt.Errorf("cursor anthropic: convert: %w", err)
 	}
 
-	mappedModel := account.GetMappedModel(req.Model)
-	agentReq := buildCursorAgentRunRequest(mappedModel, ccReq.Messages, ccReq.Tools, cursorToolChoiceString(ccReq.ToolChoice))
-	resp, _, warnings, err := s.startCursorChat(ctx, c, account, agentReq, cursorRunOptsFromAnthropic(&req))
+	agentReq := buildCursorAgentRunRequest(req.Model, ccReq.Messages, ccReq.Tools, cursorToolChoiceString(ccReq.ToolChoice))
+	resp, _, warnings, err := s.startCursorChat(ctx, c, account, agentReq)
 	if err != nil {
 		return nil, err
 	}
@@ -56,7 +55,7 @@ func (s *CursorGatewayService) ForwardAsAnthropic(
 }
 
 // ForwardAsResponses serves OpenAI /v1/responses clients through Cursor.
-// reasoning.effort is mapped onto Cursor Run slugs.
+// The requested model is sent upstream unchanged.
 func (s *CursorGatewayService) ForwardAsResponses(
 	ctx context.Context,
 	c *gin.Context,
@@ -81,9 +80,27 @@ func (s *CursorGatewayService) ForwardAsResponses(
 		return nil, fmt.Errorf("cursor responses: convert: %w", err)
 	}
 
-	mappedModel := account.GetMappedModel(req.Model)
-	agentReq := buildCursorAgentRunRequest(mappedModel, ccReq.Messages, ccReq.Tools, cursorToolChoiceString(ccReq.ToolChoice))
-	resp, _, warnings, err := s.startCursorChat(ctx, c, account, agentReq, cursorRunOptsFromResponses(&req))
+	// Codex remote compaction v2 ends the input with compaction_trigger and
+	// accepts exactly one output item of type compaction. Waiting for
+	// grok-4.7-high-fast to rewrite the whole thread takes minutes and emits
+	// nothing until the end, so Codex times out and sends the same request
+	// again. Build the handoff here and return it immediately.
+	if HasCompactionTriggerInInput(body) {
+		summary := cursorLocalCompactionSummary(ccReq.Messages)
+		ms := int(time.Since(startTime).Milliseconds())
+		if req.Stream {
+			c.Header("Content-Type", "text/event-stream")
+			c.Header("Cache-Control", "no-cache")
+			writeCursorCompactionSSE(c.Writer, req.Model, summary, cursor.TokenUsage{})
+			c.Writer.Flush()
+			return cursorForwardResult(req.Model, true, startTime, &ms, cursor.TokenUsage{}), nil
+		}
+		c.JSON(http.StatusOK, cursorCompactionResponse(req.Model, summary, cursor.TokenUsage{}))
+		return cursorForwardResult(req.Model, false, startTime, &ms, cursor.TokenUsage{}), nil
+	}
+
+	agentReq := buildCursorAgentRunRequest(req.Model, ccReq.Messages, ccReq.Tools, cursorToolChoiceString(ccReq.ToolChoice))
+	resp, _, warnings, err := s.startCursorChat(ctx, c, account, agentReq)
 	if err != nil {
 		return nil, err
 	}
@@ -93,6 +110,42 @@ func (s *CursorGatewayService) ForwardAsResponses(
 		return s.streamCursorAsResponses(c, resp.Body, req.Model, warnings, startTime)
 	}
 	return s.nonStreamCursorAsResponses(c, resp.Body, req.Model, warnings, startTime)
+}
+
+func cursorLocalCompactionSummary(messages []apicompat.ChatMessage) string {
+	const (
+		perMessage  = 2000
+		maxMessages = 40
+		maxTotal    = 16000
+	)
+	selected := messages
+	if len(selected) > maxMessages {
+		selected = selected[len(selected)-maxMessages:]
+	}
+	var b strings.Builder
+	b.WriteString("Handoff summary of the conversation so far. Continue the same task from this state.\n")
+	for _, message := range selected {
+		text := strings.TrimSpace(chatRawContentText(message.Content))
+		if text == "" {
+			continue
+		}
+		if len(text) > perMessage {
+			text = text[:perMessage] + "\n…[truncated]"
+		}
+		role := message.Role
+		if role == "" {
+			role = "user"
+		}
+		fmt.Fprintf(&b, "\n[%s]\n%s\n", role, text)
+		if b.Len() >= maxTotal {
+			b.WriteString("\n…[earlier messages omitted]\n")
+			break
+		}
+	}
+	if b.Len() == 0 {
+		return "The conversation was compacted, but no text was available to summarize."
+	}
+	return b.String()
 }
 
 func chatRawContentText(raw json.RawMessage) string {
@@ -404,4 +457,58 @@ func (s *CursorGatewayService) streamCursorAsResponses(
 	}
 	writeEvents(apicompat.FinalizeChatCompletionsResponsesStream(state))
 	return cursorForwardResult(model, true, startTime, firstTokenMs, usage), nil
+}
+
+func cursorCompactionItem(summary string) apicompat.ResponsesOutput {
+	return apicompat.ResponsesOutput{
+		Type:             "compaction",
+		ID:               fmt.Sprintf("cmp_%x", time.Now().UnixNano()),
+		Status:           "completed",
+		EncryptedContent: summary,
+		Summary:          []apicompat.ResponsesSummary{{Type: "summary_text", Text: summary}},
+	}
+}
+
+func cursorCompactionResponse(model, summary string, usage cursor.TokenUsage) apicompat.ResponsesResponse {
+	resp := apicompat.ResponsesResponse{
+		ID:        fmt.Sprintf("resp_%x", time.Now().UnixNano()),
+		Object:    "response",
+		CreatedAt: time.Now().Unix(),
+		Model:     model,
+		Status:    "completed",
+		Output:    []apicompat.ResponsesOutput{cursorCompactionItem(summary)},
+	}
+	if chatUsage := chatUsageFromCursor(usage); chatUsage != nil {
+		resp.Usage = &apicompat.ResponsesUsage{
+			InputTokens:  chatUsage.PromptTokens,
+			OutputTokens: chatUsage.CompletionTokens,
+			TotalTokens:  chatUsage.TotalTokens,
+		}
+	}
+	return resp
+}
+
+func writeCursorCompactionSSE(w io.Writer, model, summary string, usage cursor.TokenUsage) {
+	resp := cursorCompactionResponse(model, summary, usage)
+	item := resp.Output[0]
+	created := resp
+	created.Status = "in_progress"
+	created.Output = []apicompat.ResponsesOutput{}
+	created.Usage = nil
+
+	seq := 0
+	write := func(eventType string, payload map[string]any) {
+		payload["type"] = eventType
+		payload["sequence_number"] = seq
+		seq++
+		data, err := json.Marshal(payload)
+		if err != nil {
+			return
+		}
+		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", eventType, data)
+	}
+	write("response.created", map[string]any{"response": created})
+	write("response.output_item.added", map[string]any{"output_index": 0, "item": item})
+	write("response.output_item.done", map[string]any{"output_index": 0, "item": item})
+	write("response.completed", map[string]any{"response": resp})
 }
